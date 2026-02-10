@@ -2,18 +2,18 @@ BIN := bin/dkg-admin
 
 .PHONY: build
 build:
-\tcargo build --release
-\tmkdir -p bin
-\tcp target/release/dkg-admin $(BIN)
+	cargo build --release
+	mkdir -p bin
+	cp target/release/dkg-admin $(BIN)
 
 .PHONY: test
 test:
-\tcargo test
+	cargo test
 
 .PHONY: fmt
 fmt:
-\tcargo fmt
+	cargo fmt
 
 .PHONY: lint
 lint:
-\tcargo clippy -- -D warnings
+	cargo clippy -- -D warnings
