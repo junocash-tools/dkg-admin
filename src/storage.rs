@@ -46,7 +46,7 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         let f = File::open(dir)?;
-        return f.sync_all();
+        f.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -60,4 +60,3 @@ fn tmp_path_in_dir(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     tmp_name.push(".tmp");
     dir.join(tmp_name)
 }
-
