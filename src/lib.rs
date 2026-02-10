@@ -1,3 +1,4 @@
+pub mod ceremony;
 pub mod config;
 pub mod crypto;
 pub mod dkg;
@@ -7,5 +8,6 @@ pub mod export;
 pub mod hash;
 pub mod proto;
 pub mod roster;
+pub mod service;
 pub mod smoke;
 pub mod storage;

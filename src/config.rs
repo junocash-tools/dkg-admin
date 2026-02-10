@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ceremony;
 use crate::roster::{AssignedIdentifier, AssignedOperator, RosterError, RosterV1};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +73,7 @@ pub struct GrpcConfigV1 {
 pub struct ValidatedAdminConfig {
     pub cfg: AdminConfigV1,
     pub canonical_operators: Vec<AssignedOperator>,
+    pub ceremony_hash_hex: String,
 }
 
 impl AdminConfigV1 {
@@ -142,6 +144,14 @@ impl AdminConfigV1 {
             return Err(ConfigError::IdentifierZero);
         }
 
+        let ceremony_hash_hex = ceremony::ceremony_hash_hex_v1(
+            self.network,
+            self.threshold,
+            self.max_signers,
+            &self.roster_hash_hex,
+        )
+        .map_err(ConfigError::CeremonyHash)?;
+
         Ok(ValidatedAdminConfig {
             cfg: AdminConfigV1 {
                 operator_id: operator_id.to_string(),
@@ -149,6 +159,7 @@ impl AdminConfigV1 {
                 ..self
             },
             canonical_operators,
+            ceremony_hash_hex,
         })
     }
 }
@@ -185,5 +196,6 @@ pub enum ConfigError {
     RosterHashMismatch { expected: String, got: String },
     #[error("{0}")]
     Roster(#[from] RosterError),
+    #[error("{0}")]
+    CeremonyHash(#[from] ceremony::CeremonyHashError),
 }
-

@@ -6,6 +6,7 @@ use base64::Engine as _;
 use rand_core::{CryptoRng, RngCore};
 use reddsa::frost::redpallas;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 use crate::config::ValidatedAdminConfig;
 use crate::crypto;
@@ -15,6 +16,12 @@ use crate::envelope::{
 };
 use crate::hash;
 use crate::storage;
+
+#[derive(Debug, Clone)]
+pub struct ExportArtifacts {
+    pub blob_bytes: Vec<u8>,
+    pub receipt_bytes: Vec<u8>,
+}
 
 pub struct Exporter {
     cfg: ValidatedAdminConfig,
@@ -53,6 +60,84 @@ impl Exporter {
         recipients: &[String],
         out_path: &Path,
     ) -> Result<Vec<u8>, ExportError> {
+        let artifacts = self
+            .build_artifacts_age(
+                recipients,
+                ReceiptStorageV1::File {
+                    path: out_path.display().to_string(),
+                },
+            )
+            .await?;
+        storage::write_file_0600_fsync(out_path, &artifacts.blob_bytes)
+            .map_err(ExportError::StateWrite)?;
+        storage::write_file_0600_fsync(&receipt_path_for_file(out_path), &artifacts.receipt_bytes)
+            .map_err(ExportError::StateWrite)?;
+        Ok(artifacts.receipt_bytes)
+    }
+
+    pub async fn export_to_file_kms<R: RngCore + CryptoRng>(
+        &self,
+        kms: &dyn crate::encrypt::KmsProvider,
+        kms_key_id: &str,
+        out_path: &Path,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, ExportError> {
+        let artifacts = self
+            .build_artifacts_kms(
+                kms,
+                kms_key_id,
+                ReceiptStorageV1::File {
+                    path: out_path.display().to_string(),
+                },
+                rng,
+            )
+            .await?;
+        storage::write_file_0600_fsync(out_path, &artifacts.blob_bytes)
+            .map_err(ExportError::StateWrite)?;
+        storage::write_file_0600_fsync(&receipt_path_for_file(out_path), &artifacts.receipt_bytes)
+            .map_err(ExportError::StateWrite)?;
+        Ok(artifacts.receipt_bytes)
+    }
+
+    pub async fn export_to_s3(
+        &self,
+        artifacts: ExportArtifacts,
+        bucket: &str,
+        key: &str,
+        sse_kms_key_id: &str,
+    ) -> Result<(), ExportError> {
+        let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+
+        s3.put_object()
+            .bucket(bucket)
+            .key(key)
+            .server_side_encryption(ServerSideEncryption::AwsKms)
+            .ssekms_key_id(sse_kms_key_id)
+            .body(ByteStream::from(artifacts.blob_bytes))
+            .send()
+            .await
+            .map_err(|e| ExportError::S3PutFailed(e.to_string()))?;
+
+        let receipt_key = format!("{key}.KeyImportReceipt.json");
+        s3.put_object()
+            .bucket(bucket)
+            .key(receipt_key)
+            .server_side_encryption(ServerSideEncryption::AwsKms)
+            .ssekms_key_id(sse_kms_key_id)
+            .body(ByteStream::from(artifacts.receipt_bytes))
+            .send()
+            .await
+            .map_err(|e| ExportError::S3PutFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub async fn build_artifacts_age(
+        &self,
+        recipients: &[String],
+        storage: ReceiptStorageV1,
+    ) -> Result<ExportArtifacts, ExportError> {
         let (key_package, public_key_package, pk_hash) = self.load_key_material()?;
         let created_at = now_rfc3339()?;
 
@@ -72,8 +157,9 @@ impl Exporter {
                 .encode(public_key_package.serialize().map_err(ExportError::Frost)?),
         };
 
-        let plaintext_bytes =
-            serde_json::to_vec(&plaintext).map_err(|_| ExportError::PlaintextSerializeFailed)?;
+        let plaintext_bytes = Zeroizing::new(
+            serde_json::to_vec(&plaintext).map_err(|_| ExportError::PlaintextSerializeFailed)?,
+        );
         let ciphertext = crate::encrypt::age_encrypt(recipients, &plaintext_bytes)
             .map_err(ExportError::Encrypt)?;
 
@@ -88,8 +174,6 @@ impl Exporter {
         let blob_bytes =
             serde_json::to_vec(&envelope).map_err(|_| ExportError::EnvelopeSerializeFailed)?;
 
-        storage::write_file_0600_fsync(out_path, &blob_bytes).map_err(ExportError::StateWrite)?;
-
         let receipt = KeyImportReceiptV1 {
             receipt_version: RECEIPT_VERSION.to_string(),
             created_at,
@@ -102,25 +186,24 @@ impl Exporter {
             public_key_package_hash_hex: hex::encode(pk_hash),
             keyset_id: hex::encode(pk_hash),
             encrypted_blob_sha256_hex: hash::sha256_hex(&blob_bytes),
-            storage: ReceiptStorageV1::File {
-                path: out_path.display().to_string(),
-            },
+            storage,
         };
         let receipt_bytes =
             serde_json::to_vec(&receipt).map_err(|_| ExportError::ReceiptSerializeFailed)?;
-        let receipt_path = receipt_path_for_file(out_path);
-        storage::write_file_0600_fsync(&receipt_path, &receipt_bytes).map_err(ExportError::StateWrite)?;
 
-        Ok(receipt_bytes)
+        Ok(ExportArtifacts {
+            blob_bytes,
+            receipt_bytes,
+        })
     }
 
-    pub async fn export_to_file_kms<R: RngCore + CryptoRng>(
+    pub async fn build_artifacts_kms<R: RngCore + CryptoRng>(
         &self,
         kms: &dyn crate::encrypt::KmsProvider,
         kms_key_id: &str,
-        out_path: &Path,
+        storage: ReceiptStorageV1,
         rng: &mut R,
-    ) -> Result<Vec<u8>, ExportError> {
+    ) -> Result<ExportArtifacts, ExportError> {
         let (key_package, public_key_package, pk_hash) = self.load_key_material()?;
         let created_at = now_rfc3339()?;
 
@@ -140,8 +223,9 @@ impl Exporter {
                 .encode(public_key_package.serialize().map_err(ExportError::Frost)?),
         };
 
-        let plaintext_bytes =
-            serde_json::to_vec(&plaintext).map_err(|_| ExportError::PlaintextSerializeFailed)?;
+        let plaintext_bytes = Zeroizing::new(
+            serde_json::to_vec(&plaintext).map_err(|_| ExportError::PlaintextSerializeFailed)?,
+        );
 
         let kms_out = crate::encrypt::kms_encrypt(kms_key_id, &plaintext_bytes, kms, rng)
             .await
@@ -161,8 +245,6 @@ impl Exporter {
         let blob_bytes =
             serde_json::to_vec(&envelope).map_err(|_| ExportError::EnvelopeSerializeFailed)?;
 
-        storage::write_file_0600_fsync(out_path, &blob_bytes).map_err(ExportError::StateWrite)?;
-
         let receipt = KeyImportReceiptV1 {
             receipt_version: RECEIPT_VERSION.to_string(),
             created_at,
@@ -175,51 +257,15 @@ impl Exporter {
             public_key_package_hash_hex: hex::encode(pk_hash),
             keyset_id: hex::encode(pk_hash),
             encrypted_blob_sha256_hex: hash::sha256_hex(&blob_bytes),
-            storage: ReceiptStorageV1::File {
-                path: out_path.display().to_string(),
-            },
+            storage,
         };
         let receipt_bytes =
             serde_json::to_vec(&receipt).map_err(|_| ExportError::ReceiptSerializeFailed)?;
-        let receipt_path = receipt_path_for_file(out_path);
-        storage::write_file_0600_fsync(&receipt_path, &receipt_bytes).map_err(ExportError::StateWrite)?;
 
-        Ok(receipt_bytes)
-    }
-
-    pub async fn export_to_s3(
-        &self,
-        blob_bytes: Vec<u8>,
-        receipt_bytes: Vec<u8>,
-        bucket: &str,
-        key: &str,
-        sse_kms_key_id: &str,
-    ) -> Result<(), ExportError> {
-        let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let s3 = aws_sdk_s3::Client::new(&aws_cfg);
-
-        s3.put_object()
-            .bucket(bucket)
-            .key(key)
-            .server_side_encryption(ServerSideEncryption::AwsKms)
-            .ssekms_key_id(sse_kms_key_id)
-            .body(ByteStream::from(blob_bytes))
-            .send()
-            .await
-            .map_err(|e| ExportError::S3PutFailed(e.to_string()))?;
-
-        let receipt_key = format!("{key}.KeyImportReceipt.json");
-        s3.put_object()
-            .bucket(bucket)
-            .key(receipt_key)
-            .server_side_encryption(ServerSideEncryption::AwsKms)
-            .ssekms_key_id(sse_kms_key_id)
-            .body(ByteStream::from(receipt_bytes))
-            .send()
-            .await
-            .map_err(|e| ExportError::S3PutFailed(e.to_string()))?;
-
-        Ok(())
+        Ok(ExportArtifacts {
+            blob_bytes,
+            receipt_bytes,
+        })
     }
 }
 

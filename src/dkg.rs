@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use rand_core::{CryptoRng, RngCore};
 use reddsa::frost::redpallas;
 use reddsa::frost::redpallas::keys::EvenY;
+use zeroize::Zeroize;
 
 use crate::config::ValidatedAdminConfig;
 use crate::crypto;
@@ -73,9 +74,10 @@ impl AdminDkg {
         )
         .map_err(DkgError::Dkg)?;
 
-        let secret_bytes = secret.serialize().map_err(DkgError::Dkg)?;
+        let mut secret_bytes = secret.serialize().map_err(DkgError::Dkg)?;
         storage::write_file_0600_fsync(&self.state_dir().join(FILE_ROUND1_SECRET), &secret_bytes)
             .map_err(DkgError::StateWriteFailed)?;
+        secret_bytes.zeroize();
 
         let pkg_bytes = pkg.serialize().map_err(DkgError::Dkg)?;
         storage::write_file_0600_fsync(&self.state_dir().join(FILE_ROUND1_PACKAGE), &pkg_bytes)
@@ -92,12 +94,13 @@ impl AdminDkg {
         round1_packages: BTreeMap<u16, Vec<u8>>,
     ) -> Result<Part2Output, DkgError> {
         let secret_path = self.state_dir().join(FILE_ROUND1_SECRET);
-        let secret_bytes = storage::read(&secret_path).map_err(|e| DkgError::StateReadFailed {
+        let mut secret_bytes = storage::read(&secret_path).map_err(|e| DkgError::StateReadFailed {
             path: secret_path,
             source: e,
         })?;
         let secret =
             redpallas::keys::dkg::round1::SecretPackage::deserialize(&secret_bytes).map_err(DkgError::Dkg)?;
+        secret_bytes.zeroize();
 
         let mut parsed = BTreeMap::new();
         for (sender_u16, bytes) in round1_packages {
@@ -111,12 +114,13 @@ impl AdminDkg {
         let (round2_secret, round2_packages) =
             redpallas::keys::dkg::part2(secret, &parsed).map_err(DkgError::Dkg)?;
 
-        let round2_secret_bytes = round2_secret.serialize().map_err(DkgError::Dkg)?;
+        let mut round2_secret_bytes = round2_secret.serialize().map_err(DkgError::Dkg)?;
         storage::write_file_0600_fsync(
             &self.state_dir().join(FILE_ROUND2_SECRET),
             &round2_secret_bytes,
         )
         .map_err(DkgError::StateWriteFailed)?;
+        round2_secret_bytes.zeroize();
 
         let mut out = BTreeMap::new();
         for (receiver_id, pkg) in round2_packages {
@@ -140,13 +144,14 @@ impl AdminDkg {
         round2_packages: BTreeMap<u16, Vec<u8>>,
     ) -> Result<Part3Output, DkgError> {
         let round2_secret_path = self.state_dir().join(FILE_ROUND2_SECRET);
-        let round2_secret_bytes =
+        let mut round2_secret_bytes =
             storage::read(&round2_secret_path).map_err(|e| DkgError::StateReadFailed {
                 path: round2_secret_path,
                 source: e,
             })?;
         let round2_secret = redpallas::keys::dkg::round2::SecretPackage::deserialize(&round2_secret_bytes)
             .map_err(DkgError::Dkg)?;
+        round2_secret_bytes.zeroize();
 
         let mut parsed_r1 = BTreeMap::new();
         for (sender_u16, bytes) in round1_packages {
@@ -158,12 +163,13 @@ impl AdminDkg {
         }
 
         let mut parsed_r2 = BTreeMap::new();
-        for (sender_u16, bytes) in round2_packages {
+        for (sender_u16, mut bytes) in round2_packages {
             let sender: redpallas::Identifier =
                 sender_u16.try_into().map_err(|_| DkgError::IdentifierInvalid(sender_u16))?;
             let pkg =
                 redpallas::keys::dkg::round2::Package::deserialize(&bytes).map_err(DkgError::Dkg)?;
             parsed_r2.insert(sender, pkg);
+            bytes.zeroize();
         }
 
         let (key_package, public_key_package) =
@@ -172,9 +178,10 @@ impl AdminDkg {
 
         let canonicalized = public_key_package.has_even_y();
 
-        let key_package_bytes = key_package.serialize().map_err(DkgError::Dkg)?;
+        let mut key_package_bytes = key_package.serialize().map_err(DkgError::Dkg)?;
         storage::write_file_0600_fsync(&self.state_dir().join(FILE_KEY_PACKAGE), &key_package_bytes)
             .map_err(DkgError::StateWriteFailed)?;
+        key_package_bytes.zeroize();
 
         let public_key_package_bytes = public_key_package.serialize().map_err(DkgError::Dkg)?;
         storage::write_file_0600_fsync(

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rand_core::{CryptoRng, RngCore};
 use reddsa::frost::redpallas;
+use zeroize::Zeroize;
 
 use crate::storage;
 
@@ -45,9 +46,10 @@ pub fn smoke_commit<R: RngCore + CryptoRng>(
     storage::write_file_0600_fsync(&smoke_dir.join(FILE_SESSION), &session_bytes)
         .map_err(SmokeError::StateWriteFailed)?;
 
-    let nonces_bytes = nonces.serialize().map_err(SmokeError::Frost)?;
+    let mut nonces_bytes = nonces.serialize().map_err(SmokeError::Frost)?;
     storage::write_file_0600_fsync(&smoke_dir.join(FILE_NONCES), &nonces_bytes)
         .map_err(SmokeError::StateWriteFailed)?;
+    nonces_bytes.zeroize();
 
     commitments.serialize().map_err(SmokeError::Frost)
 }
@@ -82,12 +84,13 @@ pub fn smoke_sign_share(
     }
 
     let nonces_path = smoke_dir.join(FILE_NONCES);
-    let nonces_bytes = storage::read(&nonces_path).map_err(|e| SmokeError::StateReadFailed {
+    let mut nonces_bytes = storage::read(&nonces_path).map_err(|e| SmokeError::StateReadFailed {
         path: nonces_path.clone(),
         source: e,
     })?;
     let nonces =
         redpallas::round1::SigningNonces::deserialize(&nonces_bytes).map_err(SmokeError::Frost)?;
+    nonces_bytes.zeroize();
 
     let randomizer = parse_randomizer(alpha_bytes)?;
     let sig_share = redpallas::round2::sign(&signing_package, &nonces, key_package, randomizer)

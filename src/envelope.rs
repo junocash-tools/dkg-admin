@@ -28,7 +28,6 @@ pub struct KeyPackagePlaintextV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EncryptedKeyPackageEnvelopeV1 {
     pub envelope_version: String,
     pub created_at: String, // RFC3339
@@ -41,7 +40,7 @@ pub struct EncryptedKeyPackageEnvelopeV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "encryption_backend", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "encryption_backend", rename_all = "snake_case")]
 pub enum EncryptionBackendV1 {
     Age { recipients: Vec<String> },
     AwsKms {
@@ -78,4 +77,3 @@ pub enum ReceiptStorageV1 {
     File { path: String },
     S3 { bucket: String, key: String },
 }
-
