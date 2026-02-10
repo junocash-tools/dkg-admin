@@ -149,6 +149,7 @@ struct ExportKeyPackageArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_rustls_crypto_provider();
     init_tracing();
 
     let cli = Cli::parse();
@@ -165,6 +166,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Smoke { cmd } => smoke(cfg, cmd).await,
         Command::Destroy => destroy(cfg).await,
     }
+}
+
+fn init_rustls_crypto_provider() {
+    // rustls 0.23 requires selecting a process-wide CryptoProvider when multiple backends
+    // are enabled in the dependency graph (e.g. ring + aws-lc-rs).
+    //
+    // dkg-admin uses tonic's rustls TLS stack; prefer ring for consistency with tls-ring.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn init_tracing() {
