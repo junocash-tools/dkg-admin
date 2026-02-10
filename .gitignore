@@ -1,0 +1,11 @@
+# Local-only
+/AGENTS.md
+/tmp/
+/tmp-*/
+
+# Build
+/bin/
+/target/
+
+# OS
+.DS_Store

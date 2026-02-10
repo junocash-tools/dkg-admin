@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package junocash.tools.dkgadmin.v1;
+
+service DkgAdmin {
+  rpc GetRound1Package(GetRound1PackageRequest) returns (GetRound1PackageResponse);
+  rpc Part2(Part2Request) returns (Part2Response);
+  rpc Part3(Part3Request) returns (Part3Response);
+
+  rpc SmokeSignCommit(SmokeSignCommitRequest) returns (SmokeSignCommitResponse);
+  rpc SmokeSignShare(SmokeSignShareRequest) returns (SmokeSignShareResponse);
+
+  rpc ExportEncryptedKeyPackage(ExportEncryptedKeyPackageRequest) returns (ExportEncryptedKeyPackageResponse);
+  rpc Destroy(DestroyRequest) returns (DestroyResponse);
+}
+
+message GetRound1PackageRequest {
+  string ceremony_hash = 1;
+}
+
+message GetRound1PackageResponse {
+  bytes round1_package = 1;
+  bytes round1_package_hash = 2;
+}
+
+message Round1Package {
+  uint32 sender_identifier = 1; // u16 in Rust
+  bytes package = 2;
+  bytes package_hash = 3;
+}
+
+message Part2Request {
+  string ceremony_hash = 1;
+  repeated Round1Package round1_packages = 2;
+}
+
+message Round2PackageOut {
+  uint32 receiver_identifier = 1; // u16 in Rust
+  bytes package = 2;
+  bytes package_hash = 3;
+}
+
+message Part2Response {
+  repeated Round2PackageOut round2_packages = 1;
+}
+
+message Round2PackageToMe {
+  uint32 sender_identifier = 1; // u16 in Rust
+  bytes package = 2;
+  bytes package_hash = 3;
+}
+
+message Part3Request {
+  string ceremony_hash = 1;
+  repeated Round1Package round1_packages = 2;
+  repeated Round2PackageToMe round2_packages = 3;
+}
+
+message Part3Response {
+  bytes public_key_package = 1;
+  bytes public_key_package_hash = 2;
+  bytes ak_bytes = 3; // 32 bytes Orchard-compatible ak (sign bit canonicalized)
+  bool canonicalized = 4;
+}
+
+message SmokeSignCommitRequest {
+  string ceremony_hash = 1;
+  bytes message = 2;
+  bytes alpha = 3; // empty => standard signing
+}
+
+message SmokeSignCommitResponse {
+  bytes signing_commitments = 1;
+}
+
+message SmokeSignShareRequest {
+  string ceremony_hash = 1;
+  bytes signing_package = 2;
+  bytes alpha = 3; // empty => standard signing
+}
+
+message SmokeSignShareResponse {
+  bytes signature_share = 1;
+}
+
+message AgeEncryption {
+  repeated string recipients = 1; // age1...
+}
+
+message AwsKmsEncryption {
+  string kms_key_id = 1;
+}
+
+message EncryptionConfig {
+  oneof backend {
+    AgeEncryption age = 1;
+    AwsKmsEncryption aws_kms = 2;
+  }
+}
+
+message FileTarget {
+  string path = 1;
+}
+
+message S3Target {
+  string bucket = 1;
+  string key = 2;
+  string sse_kms_key_id = 3;
+}
+
+message ExportTarget {
+  oneof target {
+    FileTarget file = 1;
+    S3Target s3 = 2;
+  }
+}
+
+message ExportEncryptedKeyPackageRequest {
+  string ceremony_hash = 1;
+  EncryptionConfig encryption = 2;
+  ExportTarget target = 3;
+}
+
+message ExportEncryptedKeyPackageResponse {
+  bytes receipt_json = 1;
+}
+
+message DestroyRequest {
+  string ceremony_hash = 1;
+}
+
+message DestroyResponse {}
