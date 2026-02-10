@@ -36,6 +36,12 @@ enum Command {
     /// Export an encrypted key package blob (for import into tss-host).
     ExportKeyPackage(ExportKeyPackageArgs),
 
+    /// Produce FROST signature shares for a coordinator-provided signing package.
+    Smoke {
+        #[command(subcommand)]
+        cmd: SmokeCommand,
+    },
+
     /// Destroy local state (best-effort).
     Destroy,
 }
@@ -70,6 +76,39 @@ enum DkgCommand {
         /// Optional override of the age identity file for decrypting Round 2 packages.
         #[arg(long)]
         age_identity_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SmokeCommand {
+    /// Round 1: generate signing commitments (persists nonces in state for round 2).
+    Commit {
+        /// Message bytes to sign.
+        #[arg(long)]
+        message_file: PathBuf,
+
+        /// Optional alpha (32-byte hex) for randomized signing. If omitted, standard signing is used.
+        #[arg(long)]
+        alpha_hex: Option<String>,
+
+        /// Output file for signing commitments bytes.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Round 2: produce a signature share for the provided signing package.
+    Share {
+        /// SigningPackage bytes produced by the coordinator.
+        #[arg(long)]
+        signing_package_file: PathBuf,
+
+        /// Optional alpha (32-byte hex) for randomized signing. If omitted, standard signing is used.
+        #[arg(long)]
+        alpha_hex: Option<String>,
+
+        /// Output file for signature share bytes.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -123,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => serve(cfg).await,
         Command::Dkg { cmd } => offline_dkg(cfg, cmd).await,
         Command::ExportKeyPackage(args) => export_key_package(cfg, args).await,
+        Command::Smoke { cmd } => smoke(cfg, cmd).await,
         Command::Destroy => destroy(cfg).await,
     }
 }
@@ -352,6 +392,77 @@ async fn destroy(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
             .with_context(|| format!("remove {}", cfg.cfg.state_dir.display()))?;
     }
     Ok(())
+}
+
+async fn smoke(cfg: ValidatedAdminConfig, cmd: SmokeCommand) -> anyhow::Result<()> {
+    let kp_path = cfg.cfg.state_dir.join("key_package.bin");
+    let kp_bytes = dkg_admin::storage::read(&kp_path)
+        .with_context(|| format!("read {}", kp_path.display()))?;
+    let key_package =
+        reddsa::frost::redpallas::keys::KeyPackage::deserialize(&kp_bytes)
+            .context("deserialize key_package")?;
+
+    match cmd {
+        SmokeCommand::Commit {
+            message_file,
+            alpha_hex,
+            out,
+        } => {
+            let message = std::fs::read(&message_file)
+                .with_context(|| format!("read {}", message_file.display()))?;
+            let alpha = parse_alpha_hex(alpha_hex.as_deref())?;
+
+            let commitments = dkg_admin::smoke::smoke_commit(
+                &cfg.cfg.state_dir,
+                &key_package,
+                &message,
+                &alpha,
+                &mut rand_core::OsRng,
+            )
+            .context("smoke_commit")?;
+
+            dkg_admin::storage::write_file_0600_fsync(&out, &commitments)
+                .with_context(|| format!("write {}", out.display()))?;
+            Ok(())
+        }
+        SmokeCommand::Share {
+            signing_package_file,
+            alpha_hex,
+            out,
+        } => {
+            let signing_package = std::fs::read(&signing_package_file)
+                .with_context(|| format!("read {}", signing_package_file.display()))?;
+            let alpha = parse_alpha_hex(alpha_hex.as_deref())?;
+
+            let share = dkg_admin::smoke::smoke_sign_share(
+                &cfg.cfg.state_dir,
+                &key_package,
+                &signing_package,
+                &alpha,
+            )
+            .context("smoke_sign_share")?;
+
+            dkg_admin::storage::write_file_0600_fsync(&out, &share)
+                .with_context(|| format!("write {}", out.display()))?;
+            Ok(())
+        }
+    }
+}
+
+fn parse_alpha_hex(alpha_hex: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let Some(alpha_hex) = alpha_hex else {
+        return Ok(vec![]);
+    };
+    let alpha_hex = alpha_hex.trim();
+    if alpha_hex.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let bytes = hex::decode(alpha_hex).context("alpha_hex decode")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("alpha_len_invalid: got={}", bytes.len()));
+    }
+    Ok(bytes)
 }
 
 fn read_round1_dir(
