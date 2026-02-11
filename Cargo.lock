@@ -1143,6 +1143,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 

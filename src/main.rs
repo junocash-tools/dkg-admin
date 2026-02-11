@@ -11,8 +11,14 @@ use dkg_admin::config::{AdminConfigV1, ValidatedAdminConfig};
 use dkg_admin::envelope::ReceiptStorageV1;
 use dkg_admin::export::Exporter;
 
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit=",
+    env!("DKG_ADMIN_GIT_COMMIT")
+);
+
 #[derive(Debug, Parser)]
-#[command(name = "dkg-admin", version, about)]
+#[command(name = "dkg-admin", version, long_version = LONG_VERSION, about)]
 struct Cli {
     /// Path to the local admin config JSON.
     #[arg(long, default_value = "config.json")]

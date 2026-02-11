@@ -27,6 +27,7 @@ impl Network {
 #[serde(deny_unknown_fields)]
 pub struct AdminConfigV1 {
     pub config_version: u32,
+    pub ceremony_id: String,
 
     pub operator_id: String,
     pub identifier: u16,
@@ -80,6 +81,7 @@ pub struct ValidatedAdminConfig {
     pub cfg: AdminConfigV1,
     pub canonical_operators: Vec<AssignedOperator>,
     pub ceremony_hash_hex: String,
+    pub ceremony_id_uuid: uuid::Uuid,
 }
 
 impl AdminConfigV1 {
@@ -98,6 +100,13 @@ impl AdminConfigV1 {
         if self.config_version != 1 {
             return Err(ConfigError::ConfigVersionUnsupported(self.config_version));
         }
+
+        let ceremony_id = self.ceremony_id.trim();
+        if ceremony_id.is_empty() {
+            return Err(ConfigError::CeremonyIdEmpty);
+        }
+        let ceremony_id_uuid =
+            uuid::Uuid::parse_str(ceremony_id).map_err(|_| ConfigError::CeremonyIdInvalid)?;
 
         if !(1 < self.threshold && self.threshold <= self.max_signers) {
             return Err(ConfigError::ThresholdInvalid {
@@ -152,17 +161,20 @@ impl AdminConfigV1 {
             self.threshold,
             self.max_signers,
             &self.roster_hash_hex,
+            &ceremony_id_uuid,
         )
         .map_err(ConfigError::CeremonyHash)?;
 
         Ok(ValidatedAdminConfig {
             cfg: AdminConfigV1 {
+                ceremony_id: ceremony_id.to_string(),
                 operator_id: operator_id.to_string(),
                 roster_hash_hex: self.roster_hash_hex.trim().to_string(),
                 ..self
             },
             canonical_operators,
             ceremony_hash_hex,
+            ceremony_id_uuid,
         })
     }
 }
@@ -183,6 +195,10 @@ pub enum ConfigError {
     },
     #[error("config_version_unsupported: {0}")]
     ConfigVersionUnsupported(u32),
+    #[error("ceremony_id_empty")]
+    CeremonyIdEmpty,
+    #[error("ceremony_id_invalid")]
+    CeremonyIdInvalid,
     #[error("operator_id_empty")]
     OperatorIdEmpty,
     #[error("operator_not_in_roster: {0}")]

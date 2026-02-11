@@ -10,6 +10,7 @@ use tonic::{Request, Response, Status};
 use crate::config::{GrpcConfigV1, ValidatedAdminConfig};
 use crate::crypto;
 use crate::dkg::AdminDkg;
+use crate::dkg::DkgError;
 use crate::envelope::ReceiptStorageV1;
 use crate::export::Exporter;
 use crate::proto::v1 as pb;
@@ -28,6 +29,8 @@ struct RateState {
 }
 
 const RATE_LIMIT_PER_SEC: u32 = 64;
+const BIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BIN_COMMIT: &str = env!("DKG_ADMIN_GIT_COMMIT");
 
 impl AdminService {
     pub fn new(cfg: ValidatedAdminConfig) -> Self {
@@ -197,10 +200,99 @@ impl AdminService {
         reddsa::frost::redpallas::keys::KeyPackage::deserialize(&kp_bytes)
             .map_err(|_| Status::internal("key_package_deserialize_failed"))
     }
+
+    fn map_part2_error(err: DkgError) -> Status {
+        match err {
+            DkgError::Part2InputMismatch => Status::failed_precondition("part2_input_mismatch"),
+            _ => Status::internal("dkg_part2_failed"),
+        }
+    }
+
+    fn map_part3_error(err: DkgError) -> Status {
+        match err {
+            DkgError::Part3InputMismatch => Status::failed_precondition("part3_input_mismatch"),
+            _ => Status::internal("dkg_part3_failed"),
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl pb::dkg_admin_server::DkgAdmin for AdminService {
+    async fn get_status(
+        &self,
+        request: Request<pb::GetStatusRequest>,
+    ) -> Result<Response<pb::GetStatusResponse>, Status> {
+        self.validate_peer(&request)?;
+        self.validate_ceremony_hash(&request.get_ref().ceremony_hash)?;
+        self.check_rate_limit().await?;
+
+        let _g = self.lock.lock().await;
+        let dkg = AdminDkg::new((*self.cfg).clone());
+
+        let round1_pkg_path = dkg.state_dir().join("round1_package.bin");
+        let round2_secret_path = dkg.state_dir().join("round2_secret.bin");
+        let key_pkg_path = dkg.state_dir().join("key_package.bin");
+        let public_pkg_path = dkg.state_dir().join("public_key_package.bin");
+
+        let round1_package_hash = if round1_pkg_path.exists() {
+            let pkg = storage::read(&round1_pkg_path)
+                .map_err(|_| Status::internal("round1_package_read_failed"))?;
+            crate::hash::sha256(&pkg).to_vec()
+        } else {
+            vec![]
+        };
+
+        let part2_input_hash = if let Some(binding) = dkg
+            .read_part2_binding()
+            .map_err(|_| Status::internal("part2_binding_read_failed"))?
+        {
+            let bytes = hex::decode(binding.input_hash_hex.trim())
+                .map_err(|_| Status::internal("part2_binding_parse_failed"))?;
+            if bytes.len() != 32 {
+                return Err(Status::internal("part2_binding_hash_len_invalid"));
+            }
+            bytes
+        } else {
+            vec![]
+        };
+
+        let part3_input_hash = if let Some(binding) = dkg
+            .read_part3_binding()
+            .map_err(|_| Status::internal("part3_binding_read_failed"))?
+        {
+            let bytes = hex::decode(binding.input_hash_hex.trim())
+                .map_err(|_| Status::internal("part3_binding_parse_failed"))?;
+            if bytes.len() != 32 {
+                return Err(Status::internal("part3_binding_hash_len_invalid"));
+            }
+            bytes
+        } else {
+            vec![]
+        };
+
+        let phase = if !part3_input_hash.is_empty() || (key_pkg_path.exists() && public_pkg_path.exists()) {
+            pb::CeremonyPhase::Part3 as i32
+        } else if !part2_input_hash.is_empty() || round2_secret_path.exists() {
+            pb::CeremonyPhase::Round2 as i32
+        } else if !round1_package_hash.is_empty() {
+            pb::CeremonyPhase::Round1 as i32
+        } else {
+            pb::CeremonyPhase::Empty as i32
+        };
+
+        Ok(Response::new(pb::GetStatusResponse {
+            operator_id: self.cfg.cfg.operator_id.clone(),
+            identifier: self.cfg.cfg.identifier as u32,
+            ceremony_hash: self.cfg.ceremony_hash_hex.clone(),
+            phase,
+            round1_package_hash,
+            part2_input_hash,
+            part3_input_hash,
+            binary_version: BIN_VERSION.to_string(),
+            binary_commit: BIN_COMMIT.to_string(),
+        }))
+    }
+
     async fn get_round1_package(
         &self,
         request: Request<pb::GetRound1PackageRequest>,
@@ -255,7 +347,7 @@ impl pb::dkg_admin_server::DkgAdmin for AdminService {
 
         let out = dkg
             .part2(round1_map)
-            .map_err(|_| Status::internal("dkg_part2_failed"))?;
+            .map_err(Self::map_part2_error)?;
 
         let mut pkgs = Vec::with_capacity(out.round2_packages.len());
         for (receiver_u16, pkg) in out.round2_packages {
@@ -293,7 +385,7 @@ impl pb::dkg_admin_server::DkgAdmin for AdminService {
 
         let out = dkg
             .part3(round1_map, round2_map)
-            .map_err(|_| Status::internal("dkg_part3_failed"))?;
+            .map_err(Self::map_part3_error)?;
 
         // Enforce Orchard-compatible canonical sign bit (EvenY).
         if !crypto::is_canonical_ak_bytes(&out.ak_bytes) {

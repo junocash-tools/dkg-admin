@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use rand_core::{CryptoRng, RngCore};
 use reddsa::frost::redpallas;
 use reddsa::frost::redpallas::keys::EvenY;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::config::ValidatedAdminConfig;
@@ -18,6 +20,9 @@ const FILE_KEY_PACKAGE: &str = "key_package.bin";
 const FILE_PUBLIC_KEY_PACKAGE: &str = "public_key_package.bin";
 const FILE_PUBLIC_KEY_PACKAGE_HASH: &str = "public_key_package_hash.hex";
 const FILE_AK_BYTES: &str = "ak_bytes.hex";
+const FILE_PART2_BINDING: &str = "part2_binding.json";
+const FILE_PART3_BINDING: &str = "part3_binding.json";
+const BINDING_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct AdminDkg {
@@ -49,6 +54,33 @@ pub struct Part3Output {
     pub canonicalized: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Part2BindingV1 {
+    pub binding_version: u32,
+    pub input_hash_hex: String,
+    pub round2_packages: Vec<Part2BindingPackageV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Part2BindingPackageV1 {
+    pub receiver_identifier: u16,
+    pub package_b64: String,
+    pub package_hash_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Part3BindingV1 {
+    pub binding_version: u32,
+    pub input_hash_hex: String,
+    pub public_key_package_b64: String,
+    pub public_key_package_hash_hex: String,
+    pub ak_bytes_hex: String,
+    pub canonicalized: bool,
+}
+
 impl AdminDkg {
     pub fn new(cfg: ValidatedAdminConfig) -> Self {
         Self { cfg }
@@ -56,6 +88,42 @@ impl AdminDkg {
 
     pub fn state_dir(&self) -> &std::path::Path {
         &self.cfg.cfg.state_dir
+    }
+
+    pub fn part2_binding_path(&self) -> PathBuf {
+        self.state_dir().join(FILE_PART2_BINDING)
+    }
+
+    pub fn part3_binding_path(&self) -> PathBuf {
+        self.state_dir().join(FILE_PART3_BINDING)
+    }
+
+    pub fn read_part2_binding(&self) -> Result<Option<Part2BindingV1>, DkgError> {
+        let path = self.part2_binding_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = storage::read(&path).map_err(|e| DkgError::StateReadFailed { path, source: e })?;
+        let b: Part2BindingV1 =
+            serde_json::from_slice(&bytes).map_err(|_| DkgError::Part2BindingParseFailed)?;
+        if b.binding_version != BINDING_VERSION {
+            return Err(DkgError::BindingVersionUnsupported(b.binding_version));
+        }
+        Ok(Some(b))
+    }
+
+    pub fn read_part3_binding(&self) -> Result<Option<Part3BindingV1>, DkgError> {
+        let path = self.part3_binding_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = storage::read(&path).map_err(|e| DkgError::StateReadFailed { path, source: e })?;
+        let b: Part3BindingV1 =
+            serde_json::from_slice(&bytes).map_err(|_| DkgError::Part3BindingParseFailed)?;
+        if b.binding_version != BINDING_VERSION {
+            return Err(DkgError::BindingVersionUnsupported(b.binding_version));
+        }
+        Ok(Some(b))
     }
 
     pub fn part1<R: RngCore + CryptoRng>(&self, rng: R) -> Result<Part1Output, DkgError> {
@@ -93,6 +161,37 @@ impl AdminDkg {
         &self,
         round1_packages: BTreeMap<u16, Vec<u8>>,
     ) -> Result<Part2Output, DkgError> {
+        let input_hash = part2_input_hash(&round1_packages);
+        let input_hash_hex = hex::encode(input_hash);
+        if let Some(binding) = self.read_part2_binding()? {
+            if binding.input_hash_hex != input_hash_hex {
+                return Err(DkgError::Part2InputMismatch);
+            }
+
+            let mut out = BTreeMap::new();
+            for p in binding.round2_packages {
+                let pkg_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(p.package_b64.trim())
+                    .map_err(|_| DkgError::Part2BindingParseFailed)?;
+                let pkg_hash_bytes =
+                    hex::decode(p.package_hash_hex.trim()).map_err(|_| DkgError::Part2BindingParseFailed)?;
+                let pkg_hash: [u8; 32] = pkg_hash_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| DkgError::Part2BindingParseFailed)?;
+                out.insert(
+                    p.receiver_identifier,
+                    Round2PackageOut {
+                        package_bytes: pkg_bytes,
+                        package_hash: pkg_hash,
+                    },
+                );
+            }
+            return Ok(Part2Output {
+                round2_packages: out,
+            });
+        }
+
         let secret_path = self.state_dir().join(FILE_ROUND1_SECRET);
         let mut secret_bytes = storage::read(&secret_path).map_err(|e| DkgError::StateReadFailed {
             path: secret_path,
@@ -135,6 +234,23 @@ impl AdminDkg {
             );
         }
 
+        let binding = Part2BindingV1 {
+            binding_version: BINDING_VERSION,
+            input_hash_hex,
+            round2_packages: out
+                .iter()
+                .map(|(receiver_identifier, pkg)| Part2BindingPackageV1 {
+                    receiver_identifier: *receiver_identifier,
+                    package_b64: base64::engine::general_purpose::STANDARD.encode(&pkg.package_bytes),
+                    package_hash_hex: hex::encode(pkg.package_hash),
+                })
+                .collect(),
+        };
+        let binding_bytes =
+            serde_json::to_vec(&binding).map_err(|_| DkgError::Part2BindingSerializeFailed)?;
+        storage::write_file_0600_fsync(&self.part2_binding_path(), &binding_bytes)
+            .map_err(DkgError::StateWriteFailed)?;
+
         Ok(Part2Output { round2_packages: out })
     }
 
@@ -143,6 +259,37 @@ impl AdminDkg {
         round1_packages: BTreeMap<u16, Vec<u8>>,
         round2_packages: BTreeMap<u16, Vec<u8>>,
     ) -> Result<Part3Output, DkgError> {
+        let input_hash = part3_input_hash(&round1_packages, &round2_packages);
+        let input_hash_hex = hex::encode(input_hash);
+        if let Some(binding) = self.read_part3_binding()? {
+            if binding.input_hash_hex != input_hash_hex {
+                return Err(DkgError::Part3InputMismatch);
+            }
+
+            let public_key_package_bytes = base64::engine::general_purpose::STANDARD
+                .decode(binding.public_key_package_b64.trim())
+                .map_err(|_| DkgError::Part3BindingParseFailed)?;
+            let public_key_package_hash_vec = hex::decode(binding.public_key_package_hash_hex.trim())
+                .map_err(|_| DkgError::Part3BindingParseFailed)?;
+            let public_key_package_hash: [u8; 32] = public_key_package_hash_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| DkgError::Part3BindingParseFailed)?;
+            let ak_bytes_vec =
+                hex::decode(binding.ak_bytes_hex.trim()).map_err(|_| DkgError::Part3BindingParseFailed)?;
+            let ak_bytes: [u8; 32] = ak_bytes_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| DkgError::Part3BindingParseFailed)?;
+
+            return Ok(Part3Output {
+                public_key_package_bytes,
+                public_key_package_hash,
+                ak_bytes,
+                canonicalized: binding.canonicalized,
+            });
+        }
+
         let round2_secret_path = self.state_dir().join(FILE_ROUND2_SECRET);
         let mut round2_secret_bytes =
             storage::read(&round2_secret_path).map_err(|e| DkgError::StateReadFailed {
@@ -207,6 +354,20 @@ impl AdminDkg {
         )
         .map_err(DkgError::StateWriteFailed)?;
 
+        let binding = Part3BindingV1 {
+            binding_version: BINDING_VERSION,
+            input_hash_hex,
+            public_key_package_b64: base64::engine::general_purpose::STANDARD
+                .encode(&public_key_package_bytes),
+            public_key_package_hash_hex: hex::encode(pk_hash),
+            ak_bytes_hex: hex::encode(ak_bytes),
+            canonicalized,
+        };
+        let binding_bytes =
+            serde_json::to_vec(&binding).map_err(|_| DkgError::Part3BindingSerializeFailed)?;
+        storage::write_file_0600_fsync(&self.part3_binding_path(), &binding_bytes)
+            .map_err(DkgError::StateWriteFailed)?;
+
         Ok(Part3Output {
             public_key_package_hash: pk_hash,
             public_key_package_bytes,
@@ -234,12 +395,53 @@ fn identifier_to_u16(id: &redpallas::Identifier, max_signers: u16) -> Result<u16
     Err(DkgError::IdentifierNotU16)
 }
 
+fn part2_input_hash(round1_packages: &BTreeMap<u16, Vec<u8>>) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(64 + round1_packages.len() * (2 + 32));
+    buf.extend_from_slice(b"junocash_dkg_part2_input_v1");
+    for (sender, bytes) in round1_packages {
+        buf.extend_from_slice(&sender.to_le_bytes());
+        buf.extend_from_slice(&hash::sha256(bytes));
+    }
+    hash::sha256(&buf)
+}
+
+fn part3_input_hash(
+    round1_packages: &BTreeMap<u16, Vec<u8>>,
+    round2_packages: &BTreeMap<u16, Vec<u8>>,
+) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(96 + (round1_packages.len() + round2_packages.len()) * (2 + 32));
+    buf.extend_from_slice(b"junocash_dkg_part3_input_v1");
+    for (sender, bytes) in round1_packages {
+        buf.extend_from_slice(&sender.to_le_bytes());
+        buf.extend_from_slice(&hash::sha256(bytes));
+    }
+    for (sender, bytes) in round2_packages {
+        buf.extend_from_slice(&sender.to_le_bytes());
+        buf.extend_from_slice(&hash::sha256(bytes));
+    }
+    hash::sha256(&buf)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DkgError {
     #[error("identifier_invalid: {0}")]
     IdentifierInvalid(u16),
     #[error("identifier_not_u16")]
     IdentifierNotU16,
+    #[error("part2_input_mismatch")]
+    Part2InputMismatch,
+    #[error("part3_input_mismatch")]
+    Part3InputMismatch,
+    #[error("binding_version_unsupported: {0}")]
+    BindingVersionUnsupported(u32),
+    #[error("part2_binding_parse_failed")]
+    Part2BindingParseFailed,
+    #[error("part3_binding_parse_failed")]
+    Part3BindingParseFailed,
+    #[error("part2_binding_serialize_failed")]
+    Part2BindingSerializeFailed,
+    #[error("part3_binding_serialize_failed")]
+    Part3BindingSerializeFailed,
     #[error("dkg_error: {0}")]
     Dkg(redpallas::Error),
     #[error("crypto_error: {0}")]

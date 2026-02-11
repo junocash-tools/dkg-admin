@@ -3,6 +3,8 @@ syntax = "proto3";
 package junocash.tools.dkgadmin.v1;
 
 service DkgAdmin {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
   rpc GetRound1Package(GetRound1PackageRequest) returns (GetRound1PackageResponse);
   rpc Part2(Part2Request) returns (Part2Response);
   rpc Part3(Part3Request) returns (Part3Response);
@@ -12,6 +14,30 @@ service DkgAdmin {
 
   rpc ExportEncryptedKeyPackage(ExportEncryptedKeyPackageRequest) returns (ExportEncryptedKeyPackageResponse);
   rpc Destroy(DestroyRequest) returns (DestroyResponse);
+}
+
+enum CeremonyPhase {
+  CEREMONY_PHASE_UNSPECIFIED = 0;
+  CEREMONY_PHASE_EMPTY = 1;
+  CEREMONY_PHASE_ROUND1 = 2;
+  CEREMONY_PHASE_ROUND2 = 3;
+  CEREMONY_PHASE_PART3 = 4;
+}
+
+message GetStatusRequest {
+  string ceremony_hash = 1;
+}
+
+message GetStatusResponse {
+  string operator_id = 1;
+  uint32 identifier = 2; // u16 in Rust
+  string ceremony_hash = 3;
+  CeremonyPhase phase = 4;
+  bytes round1_package_hash = 5; // 32 bytes, optional
+  bytes part2_input_hash = 6; // 32 bytes, optional
+  bytes part3_input_hash = 7; // 32 bytes, optional
+  string binary_version = 8;
+  string binary_commit = 9;
 }
 
 message GetRound1PackageRequest {

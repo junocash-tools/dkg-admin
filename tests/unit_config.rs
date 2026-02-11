@@ -34,6 +34,7 @@ fn validate_rejects_identifier_mismatch() {
 
     let cfg = AdminConfigV1 {
         config_version: 1,
+        ceremony_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
         operator_id: "0xbbb".to_string(),
         identifier: 1, // should be 2 after sorting
         threshold: 2,
@@ -56,6 +57,7 @@ fn validate_rejects_roster_hash_mismatch() {
 
     let cfg = AdminConfigV1 {
         config_version: 1,
+        ceremony_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
         operator_id: "0xaaa".to_string(),
         identifier: 1,
         threshold: 2,
@@ -71,4 +73,3 @@ fn validate_rejects_roster_hash_mismatch() {
     let err = cfg.validate().unwrap_err();
     assert!(matches!(err, ConfigError::RosterHashMismatch { .. }));
 }
-

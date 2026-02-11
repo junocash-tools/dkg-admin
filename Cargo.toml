@@ -35,6 +35,7 @@ tonic-prost = "0.14.3"
 tower = { version = "0.5.3", features = ["limit", "util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+uuid = { version = "1.18.1", features = ["std"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
 [build-dependencies]

@@ -6,7 +6,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 
 use dkg_admin::config::{AdminConfigV1, Network, ValidatedAdminConfig};
-use dkg_admin::dkg::AdminDkg;
+use dkg_admin::dkg::{AdminDkg, DkgError};
 use dkg_admin::envelope::{EncryptedKeyPackageEnvelopeV1, EncryptionBackendV1, KeyPackagePlaintextV1};
 use dkg_admin::encrypt::{kms_decrypt, EncryptError, KmsProvider};
 use dkg_admin::export::Exporter;
@@ -34,6 +34,7 @@ fn make_configs(tmp: &tempfile::TempDir) -> Vec<ValidatedAdminConfig> {
         .map(|i| {
             let cfg = AdminConfigV1 {
                 config_version: 1,
+                ceremony_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
                 operator_id: format!("op{:02}", i),
                 identifier: i,
                 threshold,
@@ -151,6 +152,66 @@ fn rejects_invalid_round2_package() {
     let mut round1_others = round1.clone();
     round1_others.remove(&1);
     assert!(dkg1.part3(round1_others, to_me).is_err());
+}
+
+#[test]
+fn part2_part3_idempotent_with_input_binding() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfgs = make_configs(&tmp);
+
+    // Round 1
+    let mut round1 = BTreeMap::<u16, Vec<u8>>::new();
+    for cfg in &cfgs {
+        let dkg = AdminDkg::new(cfg.clone());
+        let mut seed = [0u8; 32];
+        seed[0..2].copy_from_slice(&cfg.cfg.identifier.to_le_bytes());
+        let rng = ChaCha20Rng::from_seed(seed);
+        let out = dkg.part1(rng).unwrap();
+        round1.insert(cfg.cfg.identifier, out.round1_package_bytes);
+    }
+
+    // Participant 1 part2 first run.
+    let dkg1 = AdminDkg::new(cfgs[0].clone());
+    let mut round1_for_1 = round1.clone();
+    round1_for_1.remove(&1);
+    let part2_a = dkg1.part2(round1_for_1.clone()).unwrap();
+    let part2_b = dkg1.part2(round1_for_1.clone()).unwrap();
+    assert_eq!(part2_a.round2_packages.len(), part2_b.round2_packages.len());
+
+    // Same phase, different input must fail.
+    let mut round1_modified = round1_for_1.clone();
+    let p = round1_modified.get_mut(&2).unwrap();
+    p[0] ^= 0x01;
+    let err = dkg1.part2(round1_modified).unwrap_err();
+    assert!(matches!(err, DkgError::Part2InputMismatch));
+
+    // Gather valid round2 for participant 1 and run part3 twice.
+    let mut round2_to_1 = BTreeMap::<u16, Vec<u8>>::new();
+    for cfg in &cfgs {
+        if cfg.cfg.identifier == 1 {
+            continue;
+        }
+        let dkg = AdminDkg::new(cfg.clone());
+        let mut round1_others = round1.clone();
+        round1_others.remove(&cfg.cfg.identifier);
+        let out = dkg.part2(round1_others).unwrap();
+        let pkg = out.round2_packages.get(&1).unwrap().package_bytes.clone();
+        round2_to_1.insert(cfg.cfg.identifier, pkg);
+    }
+
+    let mut round1_for_1b = round1.clone();
+    round1_for_1b.remove(&1);
+    let part3_a = dkg1.part3(round1_for_1b.clone(), round2_to_1.clone()).unwrap();
+    let part3_b = dkg1.part3(round1_for_1b.clone(), round2_to_1.clone()).unwrap();
+    assert_eq!(part3_a.public_key_package_hash, part3_b.public_key_package_hash);
+    assert_eq!(part3_a.ak_bytes, part3_b.ak_bytes);
+
+    // Different input after first success must fail.
+    let mut round2_bad = round2_to_1.clone();
+    let p = round2_bad.get_mut(&2).unwrap();
+    p[0] ^= 0x01;
+    let err = dkg1.part3(round1_for_1b, round2_bad).unwrap_err();
+    assert!(matches!(err, DkgError::Part3InputMismatch));
 }
 
 struct MockKmsProvider;

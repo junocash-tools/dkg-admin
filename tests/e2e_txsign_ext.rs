@@ -113,6 +113,7 @@ async fn e2e_impl() -> anyhow::Result<()> {
 
         let cfg_json = serde_json::json!({
             "config_version": 1,
+            "ceremony_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
             "operator_id": op_id,
             "identifier": identifier,
             "threshold": t,
@@ -157,6 +158,7 @@ async fn e2e_impl() -> anyhow::Result<()> {
 
     let ceremony_cfg = serde_json::json!({
         "config_version": 1,
+        "ceremony_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
         "threshold": t,
         "max_signers": n,
         "network": "regtest",

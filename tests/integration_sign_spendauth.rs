@@ -239,6 +239,7 @@ impl TestHarness {
             let cfg_path = tmp.path().join(format!("op{identifier:02}/config.json"));
             let cfg_json = serde_json::json!({
                 "config_version": 1,
+                "ceremony_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
                 "operator_id": operator_id,
                 "identifier": identifier,
                 "threshold": T,
