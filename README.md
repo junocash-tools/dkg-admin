@@ -26,6 +26,7 @@ This repo is part of the `junocash-tools` org.
 
 `dkg-admin` must be started with a local JSON config (`AdminConfigV1`). The config pins:
 
+- `ceremony_id` (UUID, required, included in ceremony hash)
 - `roster_hash_hex` (or the full roster contents) to prevent “swap the roster” attacks.
 - `operator_id` (stable string; recommended: lowercase hex Ethereum address).
 - `identifier` (u16) assigned deterministically:
@@ -58,6 +59,7 @@ Operator `AdminConfigV1` example (online service mode):
 ```json
 {
   "config_version": 1,
+  "ceremony_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
   "operator_id": "0x0000000000000000000000000000000000000001",
   "identifier": 1,
   "threshold": 3,
@@ -125,6 +127,11 @@ dkg-admin --config ./config.json serve
 
 - Round 2 packages are confidential; `dkg-admin` does not print them.
 - Request validation is strict: unexpected caller, wrong roster hash / ceremony hash, or invalid sequencing aborts.
+- `GetStatus` RPC is available for coordinator preflight/readiness checks and returns operator id, identifier, ceremony hash, phase, phase input hashes, and binary version/commit.
+- Part2/Part3 are strict idempotent with input binding:
+  - first successful input is committed in local binding state
+  - same input returns cached-equivalent output
+  - different input returns explicit mismatch error (`part2_input_mismatch` / `part3_input_mismatch`) without overwriting state
 - mTLS is required. Each operator configures:
   - a server certificate (and key) signed by the ceremony CA
   - a CA certificate to validate the coordinator client certificate
