@@ -8,6 +8,8 @@ This repo is part of the `junocash-tools` org.
 
 - `make build`
 - `make test`
+- `make test-e2e` (ignored heavy regtest interop e2e)
+- `make test-all`
 - `make lint`
 
 ## What This Tool Does
@@ -68,7 +70,10 @@ Operator `AdminConfigV1` example (online service mode):
     "listen_addr": "0.0.0.0:8443",
     "tls_ca_cert_pem_path": "./tls/ca.pem",
     "tls_server_cert_pem_path": "./tls/server.pem",
-    "tls_server_key_pem_path": "./tls/server.key"
+    "tls_server_key_pem_path": "./tls/server.key",
+    "tls_client_cert_pem_path": "./tls/client.pem",
+    "tls_client_key_pem_path": "./tls/client.key",
+    "tls_domain_name_override": "localhost"
   }
 }
 ```
@@ -213,6 +218,113 @@ dkg-admin --config ./config.json smoke share --signing-package-file ./signing_pa
 ```
 
 Online mode uses the same primitives over gRPC.
+
+## Production Spend-Auth Signing (`sign-spendauth`)
+
+Use this command in production to sign `juno-txsign ext-prepare` requests with threshold RedPallas FROST using the operator roster and sealed DKG key packages.
+
+Command:
+
+```bash
+dkg-admin --config ./config.json sign-spendauth \
+  --session-id 0x<64-hex> \
+  --requests ./signing_requests.v0.json \
+  --out ./spend_auth_sigs.v0.json
+```
+
+Input contract (`--requests`):
+
+- Must match `api/signing_requests.v0.schema.json` exactly.
+- `version` must be `"v0"`.
+- Unknown fields are rejected (`additionalProperties=false` behavior).
+- `requests` must be non-empty.
+- `action_index` must be unique (duplicate indices are rejected).
+- `sighash`, `alpha`, `rk` must be strict 32-byte hex (64 chars, no `0x`).
+
+Session and idempotency:
+
+- `--session-id` is required and must be strict `0x` + 32-byte hex.
+- Session state is durably persisted under `state/sign_spendauth/sessions/`.
+- Key is `(session-id, request-set-hash)`.
+- Re-running with the same inputs is idempotent and rewrites byte-identical output.
+- Reusing a `session-id` with a different request set fails with `session_conflict`.
+- Interrupted runs can be resumed safely after restart.
+
+Output contract (`--out`):
+
+- Must match `api/spend_auth_sigs.v0.schema.json`.
+- `version` is always `"v0"`.
+- Exactly one signature per request action.
+- `signatures` are sorted ascending by `action_index`.
+- `spend_auth_sig` is 64-byte RedPallas signature hex (128 chars, no `0x`).
+
+Signing behavior:
+
+- Uses roster operators over mTLS gRPC only (`grpc_endpoint` entries in config roster).
+- Enforces ceremony hash pinning for all RPCs.
+- Performs rerandomized FROST using per-request `(sighash, alpha, rk)`.
+- Verifies aggregated signature against randomized verifying key (`rk`) before emitting output.
+- Never requires spending seeds or Orchard spending keys.
+
+Exit codes:
+
+- `0`: success
+- `1`: runtime/signing/threshold/session conflict failures
+- `2`: CLI usage / input validation failures
+
+### End-to-End Example (`ext-prepare` -> `sign-spendauth` -> `ext-finalize`)
+
+1. Build a plan with `juno-txbuild`:
+
+```bash
+juno-txbuild send \
+  --rpc-url "$RPC_URL" \
+  --rpc-user "$RPC_USER" \
+  --rpc-pass "$RPC_PASS" \
+  --scan-url "$SCAN_URL" \
+  --wallet-id "$WALLET_ID" \
+  --coin-type 8135 \
+  --account 0 \
+  --to "$TO_UA" \
+  --amount-zat 1000000 \
+  --change-address "$CHANGE_UA" \
+  --out ./txplan.json
+```
+
+2. Prepare external signing requests:
+
+```bash
+juno-txsign ext-prepare \
+  --txplan ./txplan.json \
+  --ufvk "$UFVK" \
+  --out-prepared ./prepared.json \
+  --out-requests ./signing_requests.v0.json
+```
+
+3. Produce spend-auth signatures from threshold DKG participants:
+
+```bash
+dkg-admin --config ./operator1-config.json sign-spendauth \
+  --session-id 0x1111111111111111111111111111111111111111111111111111111111111111 \
+  --requests ./signing_requests.v0.json \
+  --out ./spend_auth_sigs.v0.json
+```
+
+4. Finalize signed tx:
+
+```bash
+juno-txsign ext-finalize \
+  --prepared-tx ./prepared.json \
+  --sigs ./spend_auth_sigs.v0.json \
+  --json
+```
+
+5. Broadcast and mine via `junocash-cli` / `juno-broadcast`.
+
+Schema files shipped in this repo:
+
+- `api/signing_requests.v0.schema.json`
+- `api/spend_auth_sigs.v0.schema.json`
 
 ## Destroy Local State
 
