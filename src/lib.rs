@@ -9,5 +9,6 @@ pub mod hash;
 pub mod proto;
 pub mod roster;
 pub mod service;
+pub mod sign_spendauth;
 pub mod smoke;
 pub mod storage;

@@ -62,6 +62,12 @@ pub struct GrpcConfigV1 {
     pub tls_ca_cert_pem_path: PathBuf,
     pub tls_server_cert_pem_path: PathBuf,
     pub tls_server_key_pem_path: PathBuf,
+    #[serde(default)]
+    pub tls_client_cert_pem_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_client_key_pem_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_domain_name_override: Option<String>,
 
     /// Optional hex SHA256 of the coordinator client certificate DER.
     /// If set, requests from other clients are rejected even if they chain to the CA.
@@ -105,10 +111,7 @@ impl AdminConfigV1 {
             return Err(ConfigError::OperatorIdEmpty);
         }
 
-        let roster_hash = self
-            .roster
-            .roster_hash_hex()
-            .map_err(ConfigError::Roster)?;
+        let roster_hash = self.roster.roster_hash_hex().map_err(ConfigError::Roster)?;
         if roster_hash != self.roster_hash_hex.trim() {
             return Err(ConfigError::RosterHashMismatch {
                 expected: self.roster_hash_hex,

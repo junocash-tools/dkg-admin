@@ -42,6 +42,9 @@ enum Command {
         cmd: SmokeCommand,
     },
 
+    /// Produce spend-auth signatures for juno-txsign ext-prepare requests.
+    SignSpendauth(SignSpendAuthArgs),
+
     /// Destroy local state (best-effort).
     Destroy,
 }
@@ -147,6 +150,21 @@ struct ExportKeyPackageArgs {
     s3_sse_kms_key_id: Option<String>,
 }
 
+#[derive(Debug, clap::Args)]
+struct SignSpendAuthArgs {
+    /// Session identifier (strict 0x + 32-byte hex).
+    #[arg(long)]
+    session_id: String,
+
+    /// Path to signing_requests.v0 JSON.
+    #[arg(long)]
+    requests: PathBuf,
+
+    /// Output path for spend_auth_sigs.v0 JSON.
+    #[arg(long)]
+    out: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_rustls_crypto_provider();
@@ -164,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Dkg { cmd } => offline_dkg(cfg, cmd).await,
         Command::ExportKeyPackage(args) => export_key_package(cfg, args).await,
         Command::Smoke { cmd } => smoke(cfg, cmd).await,
+        Command::SignSpendauth(args) => sign_spendauth(cfg, args).await,
         Command::Destroy => destroy(cfg).await,
     }
 }
@@ -215,10 +234,7 @@ async fn serve(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
     let svc = dkg_admin::proto::v1::dkg_admin_server::DkgAdminServer::new(svc);
 
     tracing::info!("listening on {}", grpc.listen_addr);
-    let addr = grpc
-        .listen_addr
-        .parse()
-        .context("parse grpc.listen_addr")?;
+    let addr = grpc.listen_addr.parse().context("parse grpc.listen_addr")?;
 
     Server::builder()
         .tls_config(tls)
@@ -255,13 +271,13 @@ async fn offline_dkg(cfg: ValidatedAdminConfig, cmd: DkgCommand) -> anyhow::Resu
 
             dkg_admin::storage::write_file_0600_fsync(&out, &pkg_bytes)
                 .with_context(|| format!("write {}", out.display()))?;
-            println!(
-                "round1_package_hash_hex={}",
-                hex::encode(pkg_hash)
-            );
+            println!("round1_package_hash_hex={}", hex::encode(pkg_hash));
             Ok(())
         }
-        DkgCommand::Part2 { round1_dir, out_dir } => {
+        DkgCommand::Part2 {
+            round1_dir,
+            out_dir,
+        } => {
             ensure_part1_state(dkg.state_dir())?;
             let round1_map = read_round1_dir(&cfg, &round1_dir).context("read round1_dir")?;
 
@@ -310,8 +326,8 @@ async fn offline_dkg(cfg: ValidatedAdminConfig, cmd: DkgCommand) -> anyhow::Resu
             let round1_map = read_round1_dir(&cfg, &round1_dir).context("read round1_dir")?;
             let identity = read_age_identity(&cfg, age_identity_file.as_deref())
                 .context("read age identity")?;
-            let round2_map = read_round2_dir_to_me(&cfg, &round2_dir, &identity)
-                .context("read round2_dir")?;
+            let round2_map =
+                read_round2_dir_to_me(&cfg, &round2_dir, &identity).context("read round2_dir")?;
 
             let out = dkg.part3(round1_map, round2_map).context("dkg part3")?;
 
@@ -325,7 +341,10 @@ async fn offline_dkg(cfg: ValidatedAdminConfig, cmd: DkgCommand) -> anyhow::Resu
     }
 }
 
-async fn export_key_package(cfg: ValidatedAdminConfig, args: ExportKeyPackageArgs) -> anyhow::Result<()> {
+async fn export_key_package(
+    cfg: ValidatedAdminConfig,
+    args: ExportKeyPackageArgs,
+) -> anyhow::Result<()> {
     let exporter = Exporter::new(cfg.clone());
 
     let receipt = if let Some(out_path) = args.out.as_deref() {
@@ -335,7 +354,10 @@ async fn export_key_package(cfg: ValidatedAdminConfig, args: ExportKeyPackageArg
                 .await
                 .context("export_to_file_age")?
         } else {
-            let kms_key_id = args.kms_key_id.as_deref().ok_or_else(|| anyhow!("kms_key_id missing"))?;
+            let kms_key_id = args
+                .kms_key_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("kms_key_id missing"))?;
             let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let kms_client = aws_sdk_kms::Client::new(&aws_cfg);
             let kms_provider = dkg_admin::encrypt::AwsKmsProvider::new(kms_client);
@@ -345,8 +367,14 @@ async fn export_key_package(cfg: ValidatedAdminConfig, args: ExportKeyPackageArg
                 .context("export_to_file_kms")?
         }
     } else {
-        let bucket = args.s3_bucket.as_deref().ok_or_else(|| anyhow!("s3_bucket missing"))?;
-        let key = args.s3_key.as_deref().ok_or_else(|| anyhow!("s3_key missing"))?;
+        let bucket = args
+            .s3_bucket
+            .as_deref()
+            .ok_or_else(|| anyhow!("s3_bucket missing"))?;
+        let key = args
+            .s3_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("s3_key missing"))?;
         let sse_kms_key_id = args
             .s3_sse_kms_key_id
             .as_deref()
@@ -364,7 +392,10 @@ async fn export_key_package(cfg: ValidatedAdminConfig, args: ExportKeyPackageArg
                 .await
                 .context("build_artifacts_age")?
         } else {
-            let kms_key_id = args.kms_key_id.as_deref().ok_or_else(|| anyhow!("kms_key_id missing"))?;
+            let kms_key_id = args
+                .kms_key_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("kms_key_id missing"))?;
             let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let kms_client = aws_sdk_kms::Client::new(&aws_cfg);
             let kms_provider = dkg_admin::encrypt::AwsKmsProvider::new(kms_client);
@@ -403,13 +434,25 @@ async fn destroy(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn sign_spendauth(cfg: ValidatedAdminConfig, args: SignSpendAuthArgs) -> anyhow::Result<()> {
+    let run_args = dkg_admin::sign_spendauth::SignSpendAuthArgs {
+        session_id: args.session_id,
+        requests_path: args.requests,
+        out_path: args.out,
+    };
+    if let Err(e) = dkg_admin::sign_spendauth::run(cfg, run_args).await {
+        eprintln!("{e}");
+        std::process::exit(e.exit_code());
+    }
+    Ok(())
+}
+
 async fn smoke(cfg: ValidatedAdminConfig, cmd: SmokeCommand) -> anyhow::Result<()> {
     let kp_path = cfg.cfg.state_dir.join("key_package.bin");
     let kp_bytes = dkg_admin::storage::read(&kp_path)
         .with_context(|| format!("read {}", kp_path.display()))?;
-    let key_package =
-        reddsa::frost::redpallas::keys::KeyPackage::deserialize(&kp_bytes)
-            .context("deserialize key_package")?;
+    let key_package = reddsa::frost::redpallas::keys::KeyPackage::deserialize(&kp_bytes)
+        .context("deserialize key_package")?;
 
     match cmd {
         SmokeCommand::Commit {
@@ -480,7 +523,9 @@ fn read_round1_dir(
 ) -> anyhow::Result<BTreeMap<u16, Vec<u8>>> {
     let mut map = BTreeMap::<u16, Vec<u8>>::new();
 
-    for entry in std::fs::read_dir(round1_dir).with_context(|| format!("read_dir {}", round1_dir.display()))? {
+    for entry in std::fs::read_dir(round1_dir)
+        .with_context(|| format!("read_dir {}", round1_dir.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -525,7 +570,10 @@ fn ensure_part1_state(state_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn age_recipient_for_identifier(cfg: &ValidatedAdminConfig, receiver_id: u16) -> anyhow::Result<String> {
+fn age_recipient_for_identifier(
+    cfg: &ValidatedAdminConfig,
+    receiver_id: u16,
+) -> anyhow::Result<String> {
     let op_id = cfg
         .canonical_operators
         .iter()
@@ -545,7 +593,10 @@ fn age_recipient_for_identifier(cfg: &ValidatedAdminConfig, receiver_id: u16) ->
     Ok(recip.trim().to_string())
 }
 
-fn read_age_identity(cfg: &ValidatedAdminConfig, override_path: Option<&Path>) -> anyhow::Result<String> {
+fn read_age_identity(
+    cfg: &ValidatedAdminConfig,
+    override_path: Option<&Path>,
+) -> anyhow::Result<String> {
     let path = if let Some(p) = override_path {
         p.to_path_buf()
     } else if let Some(p) = &cfg.cfg.age_identity_file {
@@ -565,7 +616,9 @@ fn read_round2_dir_to_me(
 ) -> anyhow::Result<BTreeMap<u16, Vec<u8>>> {
     let mut map = BTreeMap::<u16, Vec<u8>>::new();
 
-    for entry in std::fs::read_dir(round2_dir).with_context(|| format!("read_dir {}", round2_dir.display()))? {
+    for entry in std::fs::read_dir(round2_dir)
+        .with_context(|| format!("read_dir {}", round2_dir.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -597,8 +650,8 @@ fn read_round2_dir_to_me(
 
         let ct = std::fs::read(entry.path())
             .with_context(|| format!("read {}", entry.path().display()))?;
-        let pt = dkg_admin::encrypt::age_decrypt(age_identity, &ct)
-            .context("age decrypt round2")?;
+        let pt =
+            dkg_admin::encrypt::age_decrypt(age_identity, &ct).context("age decrypt round2")?;
         map.insert(sender, pt);
     }
 
