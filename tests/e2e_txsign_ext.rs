@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context as _};
 use dkg_admin::roster::{RosterOperatorV1, RosterV1};
 
-const JUNOCASH_VERSION: &str = "0.9.8";
+const JUNOCASH_VERSION: &str = "0.9.12";
 const JUNOCASH_RPC_USER: &str = "rpcuser";
 const JUNOCASH_RPC_PASS: &str = "rpcpass";
 
