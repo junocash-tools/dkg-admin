@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context as _};
 use dkg_admin::roster::{RosterOperatorV1, RosterV1};
 
-const JUNOCASH_VERSION: &str = "0.9.12";
+const JUNOCASH_VERSION: &str = "0.9.13";
 const JUNOCASH_RPC_USER: &str = "rpcuser";
 const JUNOCASH_RPC_PASS: &str = "rpcpass";
 
@@ -209,7 +209,7 @@ async fn e2e_impl() -> anyhow::Result<()> {
     );
     let _docker = DockerContainerGuard::start(&container_name)?;
 
-    wait_for_junocashd_rpc(&container_name, Duration::from_secs(60))?;
+    wait_for_junocashd_rpc(&container_name, Duration::from_secs(180))?;
     let rpc_host_port = docker_port(&container_name, "8232/tcp")?;
     let rpc_url = format!("http://{rpc_host_port}");
 
@@ -259,6 +259,12 @@ async fn e2e_impl() -> anyhow::Result<()> {
     docker_cli(&container_name, &["generate", "2"])?;
 
     wait_for_scan_note(&scan_url, &wallet_id, Duration::from_secs(120))?;
+    http_post_json(
+        &format!("{scan_url}/v1/wallets/{wallet_id}/backfill"),
+        &serde_json::json!({ "batch_size": 10_000 }),
+        Duration::from_secs(120),
+    )?;
+    wait_for_scanner_ready_at_node(&scan_url, &container_name, Duration::from_secs(120))?;
 
     let node_ua = junocash_get_address_for_account(&container_name, 0)?;
     let txplan_path = tmp.path().join("txplan.json");
@@ -502,6 +508,11 @@ impl DockerContainerGuard {
             .arg("-listen=0")
             .arg("-txindex=1")
             .arg("-printtoconsole=1")
+            .arg("-nuparams=5437f330:1")
+            .arg("-txunpaidactionlimit=10000")
+            .arg("-blockunpaidactionlimit=0")
+            .arg("-txexpirydelta=4")
+            .arg("-blockmintxfee=0")
             .arg("-datadir=/data")
             .arg("-rpcbind=0.0.0.0")
             .arg("-rpcallowip=0.0.0.0/0")
@@ -718,6 +729,56 @@ fn wait_for_scan_note(scan_url: &str, wallet_id: &str, timeout: Duration) -> any
         }
         if start.elapsed() > timeout {
             return Err(anyhow!("scan_note_timeout"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn wait_for_scanner_ready_at_node(
+    scan_url: &str,
+    container: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let node_height = docker_cli(container, &["getblockcount"])?
+        .trim()
+        .parse::<i64>()
+        .context("parse node height")?;
+    let node_hash = docker_cli(container, &["getblockhash", &node_height.to_string()])?
+        .trim()
+        .to_string();
+    let url = format!("{scan_url}/v1/health");
+    let start = Instant::now();
+    loop {
+        let out = Command::new("curl")
+            .arg("-sS")
+            .arg("--max-time")
+            .arg("5")
+            .arg(&url)
+            .output()
+            .context("curl scanner health")?;
+        let last_health = if out.status.success() {
+            let health = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                let hash_matches = v["scanned_hash"]
+                    .as_str()
+                    .map(|hash| hash.trim().eq_ignore_ascii_case(&node_hash))
+                    .unwrap_or(false);
+                if v["status"].as_str() == Some("ok")
+                    && v["ready"].as_bool() == Some(true)
+                    && v["scanned_height"].as_i64() == Some(node_height)
+                    && hash_matches
+                {
+                    return Ok(());
+                }
+            }
+            health
+        } else {
+            String::from_utf8_lossy(&out.stderr).trim().to_string()
+        };
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "scanner_ready_timeout: node_height={node_height} node_hash={node_hash} last_health={last_health}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(250));
     }
