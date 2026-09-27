@@ -10,6 +10,7 @@ use zeroize::Zeroize;
 
 use crate::config::ValidatedAdminConfig;
 use crate::proto::v1 as pb;
+use crate::sign_policy::POLICY_REJECTED;
 use crate::storage;
 
 const V0: &str = "v0";
@@ -23,6 +24,14 @@ pub struct SignSpendAuthArgs {
     pub session_id: String,
     pub requests_path: PathBuf,
     pub out_path: PathBuf,
+    /// Spend context for peers with a signing policy (txplan + prepared tx).
+    pub policy_inputs: Option<PolicyInputsPaths>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyInputsPaths {
+    pub txplan_path: PathBuf,
+    pub prepared_tx_path: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +143,25 @@ pub async fn run(
     let requests = parse_requests(&requests_raw)?;
     let request_set_hash_hex = hex::encode(request_set_hash(&requests)?);
 
+    let policy_inputs = match &args.policy_inputs {
+        None => None,
+        Some(p) => {
+            let txplan = std::fs::read(&p.txplan_path).map_err(|_| {
+                SignSpendAuthError::Validation(format!(
+                    "txplan_read_failed: {}",
+                    p.txplan_path.display()
+                ))
+            })?;
+            let prepared_tx = std::fs::read(&p.prepared_tx_path).map_err(|_| {
+                SignSpendAuthError::Validation(format!(
+                    "prepared_tx_read_failed: {}",
+                    p.prepared_tx_path.display()
+                ))
+            })?;
+            Some((txplan, prepared_tx))
+        }
+    };
+
     let sessions_dir = cfg
         .cfg
         .state_dir
@@ -156,6 +184,9 @@ pub async fn run(
 
     let public_key_package = load_public_key_package(&cfg)?;
     let mut clients = connect_all_operators(&cfg).await?;
+    if let Some((txplan, prepared_tx)) = policy_inputs {
+        approve_all(&cfg, &mut clients, txplan, prepared_tx, requests_raw).await?;
+    }
 
     let abort_after = parse_abort_after_action();
     let mut signatures = Vec::with_capacity(requests.len());
@@ -257,6 +288,78 @@ fn parse_requests(bytes: &[u8]) -> Result<Vec<NormalizedRequest>, SignSpendAuthE
 
     out.sort_by_key(|r| r.action_index);
     Ok(out)
+}
+
+/// Sends the spend context to every connected peer. Peers with a signing policy
+/// check it and remember the approved (sighash, alpha) pairs; peers that reject it
+/// are dropped from this session. Peers without the RPC (older builds) are kept.
+async fn approve_all(
+    cfg: &ValidatedAdminConfig,
+    clients: &mut BTreeMap<u16, pb::dkg_admin_client::DkgAdminClient<Channel>>,
+    txplan: Vec<u8>,
+    prepared_tx: Vec<u8>,
+    signing_requests: Vec<u8>,
+) -> Result<(), SignSpendAuthError> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (id, client) in clients.iter() {
+        let id = *id;
+        let mut client = client.clone();
+        let req = pb::ApproveSpendAuthRequest {
+            ceremony_hash: cfg.ceremony_hash_hex.clone(),
+            txplan: txplan.clone(),
+            prepared_tx: prepared_tx.clone(),
+            signing_requests: signing_requests.clone(),
+        };
+        tasks.spawn(async move { (id, client.approve_spend_auth(req).await) });
+    }
+
+    let mut rejections = BTreeMap::<u16, String>::new();
+    let mut failed = BTreeSet::<u16>::new();
+    while let Some(joined) = tasks.join_next().await {
+        let (id, res) = joined
+            .map_err(|_| SignSpendAuthError::Runtime("approve_task_failed".to_string()))?;
+        match res {
+            Ok(_) => {}
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                tracing::warn!(identifier = id, "peer does not support ApproveSpendAuth; no policy check");
+            }
+            Err(status)
+                if status.code() == tonic::Code::PermissionDenied
+                    && status.message().starts_with(POLICY_REJECTED) =>
+            {
+                tracing::warn!(identifier = id, reason = %status.message(), "peer rejected spend");
+                rejections.insert(id, status.message().to_string());
+            }
+            Err(status) => {
+                tracing::warn!(identifier = id, code = ?status.code(), message = %status.message(), "approve failed");
+                failed.insert(id);
+            }
+        }
+    }
+
+    for id in rejections.keys().chain(failed.iter()) {
+        clients.remove(id);
+    }
+
+    let threshold = usize::from(cfg.cfg.threshold);
+    if clients.len() < threshold {
+        if rejections.is_empty() {
+            return Err(SignSpendAuthError::Runtime(format!(
+                "threshold_unmet: need={threshold} have={}",
+                clients.len()
+            )));
+        }
+        let reasons = rejections
+            .iter()
+            .map(|(id, r)| format!("{id}={r}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(SignSpendAuthError::Runtime(format!(
+            "{POLICY_REJECTED}: need={threshold} have={} rejections=[{reasons}]",
+            clients.len()
+        )));
+    }
+    Ok(())
 }
 
 fn decode_hex_exact<const N: usize>(

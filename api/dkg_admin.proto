@@ -12,6 +12,11 @@ service DkgAdmin {
   rpc SmokeSignCommit(SmokeSignCommitRequest) returns (SmokeSignCommitResponse);
   rpc SmokeSignShare(SmokeSignShareRequest) returns (SmokeSignShareResponse);
 
+  // Checks a spend against the peer's signing policy before signing. With a policy
+  // enabled, SmokeSignCommit/SmokeSignShare only accept approved (sighash, alpha)
+  // pairs. Rejections return PERMISSION_DENIED "policy_rejected: <reason>".
+  rpc ApproveSpendAuth(ApproveSpendAuthRequest) returns (ApproveSpendAuthResponse);
+
   rpc ExportEncryptedKeyPackage(ExportEncryptedKeyPackageRequest) returns (ExportEncryptedKeyPackageResponse);
   rpc Destroy(DestroyRequest) returns (DestroyResponse);
 }
@@ -107,6 +112,17 @@ message SmokeSignShareRequest {
 
 message SmokeSignShareResponse {
   bytes signature_share = 1;
+}
+
+message ApproveSpendAuthRequest {
+  string ceremony_hash = 1;
+  bytes txplan = 2;           // txplan v0 JSON
+  bytes prepared_tx = 3;      // juno-txsign ext-prepare prepared tx v0 JSON
+  bytes signing_requests = 4; // signing_requests v0 JSON
+}
+
+message ApproveSpendAuthResponse {
+  bool enforced = 1; // false => this peer has no signing policy configured
 }
 
 message AgeEncryption {

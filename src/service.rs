@@ -14,12 +14,18 @@ use crate::dkg::DkgError;
 use crate::envelope::ReceiptStorageV1;
 use crate::export::Exporter;
 use crate::proto::v1 as pb;
+use crate::sign_policy::{
+    ApprovalCache, PolicyRejection, SignPolicy, MAX_APPROVALS, MAX_CONCURRENT_APPROVALS, POLICY_REJECTED,
+};
 use crate::storage;
 
 pub struct AdminService {
     cfg: Arc<ValidatedAdminConfig>,
     lock: Mutex<()>,
     rate: Mutex<RateState>,
+    sign_policy: Option<Arc<SignPolicy>>,
+    approvals: std::sync::Mutex<ApprovalCache>,
+    approve_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
@@ -41,7 +47,46 @@ impl AdminService {
                 window_start: Instant::now(),
                 count: 0,
             }),
+            sign_policy: None,
+            approvals: std::sync::Mutex::new(ApprovalCache::new(Duration::from_secs(1), 1)),
+            approve_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_APPROVALS)),
         }
+    }
+
+    /// Enables the signing policy: every commitment/share must be for a spend
+    /// approved through ApproveSpendAuth.
+    pub fn with_sign_policy(mut self, policy: SignPolicy) -> Self {
+        self.approvals = std::sync::Mutex::new(ApprovalCache::new(policy.approval_ttl(), MAX_APPROVALS));
+        self.sign_policy = Some(Arc::new(policy));
+        self
+    }
+
+    fn policy_rejected(&self, rejection: &PolicyRejection) -> Status {
+        tracing::warn!(
+            operator_id = %self.cfg.cfg.operator_id,
+            identifier = self.cfg.cfg.identifier,
+            reason = %rejection,
+            "sign policy rejected spend"
+        );
+        Status::permission_denied(format!("{POLICY_REJECTED}: {rejection}"))
+    }
+
+    fn require_approval(&self, message: &[u8], alpha: &[u8]) -> Result<(), Status> {
+        if self.sign_policy.is_none() {
+            return Ok(());
+        }
+        let approved = self
+            .approvals
+            .lock()
+            .map(|mut c| c.contains(message, alpha, Instant::now()))
+            .unwrap_or(false);
+        if approved {
+            return Ok(());
+        }
+        Err(self.policy_rejected(&PolicyRejection {
+            code: "not_approved",
+            detail: format!("sighash={}", hex::encode(message)),
+        }))
     }
 
     fn grpc_cfg(&self) -> Result<&GrpcConfigV1, Status> {
@@ -416,6 +461,7 @@ impl pb::dkg_admin_server::DkgAdmin for AdminService {
         if !alpha.is_empty() && alpha.len() != 32 {
             return Err(Status::invalid_argument("alpha_len_invalid"));
         }
+        self.require_approval(&request.get_ref().message, &alpha)?;
 
         let commitments = crate::smoke::smoke_commit(
             &self.cfg.cfg.state_dir,
@@ -447,6 +493,12 @@ impl pb::dkg_admin_server::DkgAdmin for AdminService {
         if !alpha.is_empty() && alpha.len() != 32 {
             return Err(Status::invalid_argument("alpha_len_invalid"));
         }
+        if self.sign_policy.is_some() {
+            let signing_package =
+                reddsa::frost::redpallas::SigningPackage::deserialize(&request.get_ref().signing_package)
+                    .map_err(|_| Status::invalid_argument("signing_package_invalid"))?;
+            self.require_approval(signing_package.message(), &alpha)?;
+        }
 
         let sig_share = crate::smoke::smoke_sign_share(
             &self.cfg.cfg.state_dir,
@@ -459,6 +511,76 @@ impl pb::dkg_admin_server::DkgAdmin for AdminService {
         Ok(Response::new(pb::SmokeSignShareResponse {
             signature_share: sig_share,
         }))
+    }
+
+    async fn approve_spend_auth(
+        &self,
+        request: Request<pb::ApproveSpendAuthRequest>,
+    ) -> Result<Response<pb::ApproveSpendAuthResponse>, Status> {
+        self.validate_peer(&request)?;
+        self.validate_ceremony_hash(&request.get_ref().ceremony_hash)?;
+        self.check_rate_limit().await?;
+
+        let Some(policy) = self.sign_policy.clone() else {
+            return Ok(Response::new(pb::ApproveSpendAuthResponse { enforced: false }));
+        };
+
+        // Bound the number of evaluations and verifier processes in flight. Fail
+        // fast rather than queueing into the coordinator's request timeout.
+        let _slot = self
+            .approve_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("approvals_busy"))?;
+
+        let key_package = {
+            let _g = self.lock.lock().await;
+            self.load_key_package().await?
+        };
+        let group_key = *key_package.verifying_key();
+
+        let req = request.into_inner();
+        let eval_policy = policy.clone();
+        let approved = tokio::task::spawn_blocking(move || {
+            eval_policy.evaluate(&group_key, &req.txplan, &req.prepared_tx, &req.signing_requests)
+        })
+        .await
+        .map_err(|_| Status::internal("sign_policy_eval_failed"))?
+        .map_err(|r| self.policy_rejected(&r))?;
+
+        let context = approved.verifier_context(
+            &policy,
+            &self.cfg.cfg.operator_id,
+            self.cfg.cfg.identifier,
+            &self.cfg.ceremony_hash_hex,
+        );
+        let context = serde_json::to_vec(&context).map_err(|_| Status::internal("verifier_context_encode_failed"))?;
+        policy
+            .run_verifier(&context)
+            .await
+            .map_err(|r| self.policy_rejected(&r))?;
+
+        {
+            let mut cache = self
+                .approvals
+                .lock()
+                .map_err(|_| Status::internal("approval_cache_poisoned"))?;
+            let now = Instant::now();
+            for alpha in &approved.alphas {
+                cache.insert(approved.sighash, *alpha, now);
+            }
+        }
+        tracing::info!(
+            operator_id = %self.cfg.cfg.operator_id,
+            identifier = self.cfg.cfg.identifier,
+            sighash = %hex::encode(approved.sighash),
+            spends = approved.spend_count,
+            outputs = approved.outputs.len(),
+            fee_zat = approved.fee_zat,
+            "sign policy approved spend"
+        );
+
+        Ok(Response::new(pb::ApproveSpendAuthResponse { enforced: true }))
     }
 
     async fn export_encrypted_key_package(

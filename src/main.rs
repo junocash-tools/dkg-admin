@@ -31,7 +31,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the mTLS gRPC service for an online DKG ceremony.
-    Serve,
+    Serve {
+        /// Signing policy JSON. When set, commitments and signature shares are only
+        /// produced for spends approved against this policy.
+        #[arg(long)]
+        sign_policy_file: Option<PathBuf>,
+    },
 
     /// Offline DKG file-mode commands.
     Dkg {
@@ -169,6 +174,14 @@ struct SignSpendAuthArgs {
     /// Output path for spend_auth_sigs.v0 JSON.
     #[arg(long)]
     out: PathBuf,
+
+    /// txplan v0 JSON for peers with a signing policy (requires --prepared-tx).
+    #[arg(long, requires = "prepared_tx")]
+    txplan: Option<PathBuf>,
+
+    /// Prepared tx v0 JSON from juno-txsign ext-prepare (requires --txplan).
+    #[arg(long, requires = "txplan")]
+    prepared_tx: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -184,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         .context("validate config")?;
 
     match cli.cmd {
-        Command::Serve => serve(cfg).await,
+        Command::Serve { sign_policy_file } => serve(cfg, sign_policy_file).await,
         Command::Dkg { cmd } => offline_dkg(cfg, cmd).await,
         Command::ExportKeyPackage(args) => export_key_package(cfg, args).await,
         Command::Smoke { cmd } => smoke(cfg, cmd).await,
@@ -212,7 +225,7 @@ fn init_tracing() {
         .init();
 }
 
-async fn serve(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
+async fn serve(cfg: ValidatedAdminConfig, sign_policy_file: Option<PathBuf>) -> anyhow::Result<()> {
     let grpc = cfg
         .cfg
         .grpc
@@ -236,7 +249,34 @@ async fn serve(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
         .identity(identity)
         .client_ca_root(client_ca);
 
-    let svc = dkg_admin::service::AdminService::new(cfg);
+    let sign_policy = match &sign_policy_file {
+        None => None,
+        Some(path) => {
+            let policy = dkg_admin::sign_policy::SignPolicy::from_path(path, cfg.cfg.network)?;
+            // Fail fast when the policy UFVK is for another key. Before the DKG has
+            // finished there is no key yet; approvals re-check it on every call.
+            let kp_path = cfg.cfg.state_dir.join("key_package.bin");
+            if let Ok(kp_bytes) = dkg_admin::storage::read(&kp_path) {
+                let kp = reddsa::frost::redpallas::keys::KeyPackage::deserialize(&kp_bytes)
+                    .map_err(|_| anyhow!("key package deserialize failed"))?;
+                policy
+                    .check_group_key(kp.verifying_key())
+                    .map_err(|e| anyhow!("sign_policy_invalid: {e}"))?;
+            }
+            tracing::info!(
+                path = %path.display(),
+                change_address = %policy.change_address(),
+                max_fee_zat = policy.max_fee_zat(),
+                max_spends = policy.max_spends(),
+                "sign policy enabled"
+            );
+            Some(policy)
+        }
+    };
+    let mut svc = dkg_admin::service::AdminService::new(cfg);
+    if let Some(policy) = sign_policy {
+        svc = svc.with_sign_policy(policy);
+    }
     let svc = dkg_admin::proto::v1::dkg_admin_server::DkgAdminServer::new(svc);
 
     tracing::info!("listening on {}", grpc.listen_addr);
@@ -441,10 +481,24 @@ async fn destroy(cfg: ValidatedAdminConfig) -> anyhow::Result<()> {
 }
 
 async fn sign_spendauth(cfg: ValidatedAdminConfig, args: SignSpendAuthArgs) -> anyhow::Result<()> {
+    let policy_inputs = match (args.txplan, args.prepared_tx) {
+        (None, None) => None,
+        (Some(txplan_path), Some(prepared_tx_path)) => {
+            Some(dkg_admin::sign_spendauth::PolicyInputsPaths {
+                txplan_path,
+                prepared_tx_path,
+            })
+        }
+        _ => {
+            eprintln!("sign_policy_inputs_incomplete: --txplan and --prepared-tx go together");
+            std::process::exit(2);
+        }
+    };
     let run_args = dkg_admin::sign_spendauth::SignSpendAuthArgs {
         session_id: args.session_id,
         requests_path: args.requests,
         out_path: args.out,
+        policy_inputs,
     };
     if let Err(e) = dkg_admin::sign_spendauth::run(cfg, run_args).await {
         eprintln!("{e}");
