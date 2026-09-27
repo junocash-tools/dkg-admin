@@ -333,6 +333,117 @@ Schema files shipped in this repo:
 - `api/signing_requests.v0.schema.json`
 - `api/spend_auth_sigs.v0.schema.json`
 
+## Signing Policy (`serve --sign-policy-file`)
+
+By default a peer signs whatever the coordinator sends it. With a signing policy, every peer
+checks the transaction itself before it hands out a commitment or a signature share, so a
+compromised coordinator can't get a spend signed that the peers wouldn't approve.
+
+The policy is off unless `--sign-policy-file` is passed. Without it the service behaves exactly
+as before.
+
+```bash
+dkg-admin --config ./config.json serve --sign-policy-file ./sign-policy.json
+```
+
+Policy file:
+
+```json
+{
+  "version": "v1",
+  "ufvk": "jview1...",
+  "change_address": "j1...",
+  "max_fee_zat": 10000000,
+  "max_spends": 200,
+  "verifier_cmd": ["/usr/local/bin/withdraw-verifier", "--strict"],
+  "verifier_env": { "VERIFIER_RPC_URL": "http://127.0.0.1:8545" },
+  "verifier_timeout_secs": 20,
+  "approval_ttl_secs": 300
+}
+```
+
+- `ufvk`: the group UFVK. Its spend validating key must equal the DKG group key. This is checked
+  at startup when the key package exists, and again on every approval.
+- `change_address`: the only allowed change address. Must be owned by `ufvk`.
+- `max_fee_zat`: default `10000000`.
+- `max_spends`: max number of notes in a plan, default `200`.
+- `verifier_cmd`: required. argv of an external allowlist command (no shell).
+- `verifier_env`: optional extra environment for the verifier. The verifier does not inherit the
+  peer's environment; it only gets `PATH` plus these variables.
+- `verifier_timeout_secs`: default `20`, max `25`.
+- `approval_ttl_secs`: how long an approved `(sighash, alpha)` stays signable, default `300`.
+- Address/UFVK network comes from the config `network`. Unknown fields are rejected.
+
+The coordinator passes the plan and the prepared tx next to the signing requests:
+
+```bash
+dkg-admin --config ./operator1-config.json sign-spendauth \
+  --session-id 0x<64-hex> \
+  --txplan ./txplan.json \
+  --prepared-tx ./prepared.json \
+  --requests ./signing_requests.v0.json \
+  --out ./spend_auth_sigs.v0.json
+```
+
+`--txplan` and `--prepared-tx` go together. The coordinator sends them to every peer
+(`ApproveSpendAuth`) before signing starts. Each peer with a policy then checks:
+
+- the sighash recomputed from the prepared tx equals every requested sighash, and each
+  request's `rk`/`alpha` matches the spend action and the group key;
+- the requested spends are exactly the plan notes (decrypted with the UFVK), and the tx value
+  balance equals the plan fee;
+- the outputs recovered with the UFVK outgoing viewing keys are exactly the plan outputs plus
+  change to `change_address`. Since our spends and the value balance are pinned, any output the
+  OVK can't recover could only be funded by inputs that aren't ours;
+- `change_address == policy change_address`, `fee_zat <= max_fee_zat`, `len(notes) <= max_spends`;
+- the tx is on the NU6.2 branch, no `rk` repeats across actions, and the bundle has no more
+  actions than the plan needs;
+- the verifier command exits `0`.
+
+The verifier gets a JSON document on stdin:
+
+```json
+{
+  "version": "v1",
+  "operator_id": "0x...",
+  "identifier": 1,
+  "ceremony_hash": "...",
+  "network": "mainnet",
+  "sighash": "...",
+  "fee_zat": "15000",
+  "change_address": "j1...",
+  "change_zat": "735000",
+  "spend_count": 1,
+  "outputs": [{ "to_address": "j1...", "amount_zat": "250000", "memo_hex": "f600..." }],
+  "signing_requests": [{ "action_index": 0, "alpha": "...", "rk": "..." }],
+  "txplan": { "...": "the plan as sent by the coordinator" }
+}
+```
+
+`outputs` are the non-change outputs, already checked against the transaction, with canonical
+addresses and the full 512-byte memo. Any non-zero exit or timeout rejects the spend. The
+verifier's whole process group is killed once it exits or times out. Its stderr (truncated to
+512 chars) ends up in the rejection reason and is sent back to the coordinator, so don't write
+secrets to it.
+
+With a policy enabled, the peer only produces commitments and shares for approved
+`(sighash, alpha)` pairs. That also covers the smoke RPCs, so smoke signing against a policy
+peer fails with `not_approved`.
+
+Rejections come back as gRPC `PERMISSION_DENIED` with message `policy_rejected: <code>[: detail]`
+and the peer logs `sign policy rejected spend` with the reason. Codes include
+`change_address_mismatch`, `fee_over_cap`, `too_many_spends`, `verifier_rejected`,
+`sighash_mismatch`, `spend_set_mismatch`, `outputs_mismatch`, `value_balance_mismatch`,
+`rk_mismatch`, `rk_reused`, `alpha_mismatch`, `branch_id_unsupported` and `actions_too_many`. `sign-spendauth` drops rejecting peers and fails with
+`policy_rejected: need=<t> have=<n> rejections=[...]` if fewer than threshold approve.
+
+A peer evaluates at most 4 approvals at once; beyond that it answers `RESOURCE_EXHAUSTED`
+(`approvals_busy`) and the coordinator drops it for that run.
+
+Peers without a policy answer `enforced=false`; peers running an older release answer
+`UNIMPLEMENTED` and are used as before. For the policy to mean anything, at least
+`max_signers - threshold + 1` peers need it.
+
 ## Destroy Local State
 
 ```bash
